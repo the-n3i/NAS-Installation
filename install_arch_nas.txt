@@ -219,8 +219,9 @@ tune2fs -E stride=n,stripe-width=m /dev/mdx
 mount /dev/DATA/theData /my/random/mountpoint
 
 #####################
-## Additional tuning
+## HDD spindown
 #####################
+
 
 # send HDDs in standby immediately:
 hdparm -y /dev/sd[b-d]
@@ -230,3 +231,24 @@ hdparm -S 241 /dev/sd[b-d]
 
 # check HDD standby status
 hdparm -C /dev/sd[b-d]
+
+# make startup script for HDD spindown:
+# Add file /etc/systemd/system/hdd-spindown.service
+[Unit]
+Description=Power-off gpu
+
+[Service]
+Type=oneshot
+ExecStart=hdparm -S 241 /dev/sd[b-d]
+
+[Install]
+WantedBy=multi-user.target
+
+
+# now enable it:
+systemctl enable hdd-spindown.service
+
+#####################
+## Additional tuning
+#####################
+
