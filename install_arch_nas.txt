@@ -1,0 +1,232 @@
+dhcpcd enp0s25
+
+ping -c3 golem.de
+timedatectl set-ntp true
+
+# Check if EFI mode:
+ls /sys/firmware/efi/efivars
+
+####################
+## Set up partitions
+####################
+# Find right block device (SSD)
+lsblk
+gdisk /dev/sda
+# new partition table
+GPT
+EFI: 2048s +512M ef00
+Root: +20G 8300
+SSD-Data: +30G 8300
+LVM-cache: 100% 8e00
+
+mkfs.fat -F 32 /dev/sda1 # EFI boot
+mkfs.ext4 -L OS /dev/sda2 # OS
+mkfs.ext4 -L SSD-DATA /dev/sda3 # OS
+
+
+
+####################
+## Install OS
+####################
+mount /dev/sda2 /mnt # OS
+mkdir /mnt/boot
+mount /dev/sda1 /mnt/boot # boot
+
+
+#pacstrap /mnt base base-devel xorg-server xorg-xinit xorg-utils xorg-server-utils ttf-dejavu cinnamon bash-completion  wpa_supplicant gnome-terminal grub xf86-input-synaptics
+pacstrap /mnt base bash-completion
+genfstab -U /mnt > /mnt/etc/fstab
+
+arch-chroot /mnt
+ln -s /usr/share/zoneinfo/Europe/Berlin /etc/localtime
+hwclock --systohc
+
+nano /etc/locale.gen # uncomment en_US.UTF8 and de_DE.UTF8
+locale-gen
+echo "LANG=en_US.UTF8" > /etc/locale.conf
+echo "GENISYS" > /etc/hostname
+echo "127.0.0.1      GENISYS.localdomain GENISYS" >> /etc/hosts
+echo "::1            GENISYS.localdomain GENISYS" >> /etc/hosts
+
+passwd
+
+nano /etc/fstab
+# Change parameters:
+* rw,defaults,noatime,discard # for ssd root
+
+# build kernel image for boot
+mkinitcpio -p linux
+
+# enable dhcp in installed arch
+systemctl enable dhcpcd
+
+####################
+## STUPID UEFI STUFF bootloader
+####################
+pacman -S efibootmgr dosfstools gptfdisk
+bootctl install
+nano /boot/loader/entries/arch-uefi.conf
+
+title    Arch Linux
+linux    /vmlinuz-linux
+initrd   /initramfs-linux.img
+options  root=LABEL=OS rw
+
+cp /boot/loader/entries/arch-uefi.conf /boot/loader/entries/arch-uefi-fallback.conf
+nano /boot/loader/entries/arch-uefi-fallback.conf # change title to fallback
+# change image to:
+initrd   /initramfs-linux-fallback.img
+
+nano /boot/loader/loader.conf
+
+timeout 1
+default arch-uefi
+
+
+
+
+####################
+# REBOOT
+####################
+
+pacman -S openssh
+edit /etc/ssh/sshd_config
+systemctl enable sshd
+
+exit
+umount /mnt/boot
+umount /mnt
+reboot
+
+
+
+####################
+# RAID
+####################
+
+pacman -S hdparm
+
+# deactivate HDD write cache for each HDD
+hdparm -W0 /dev/sdc
+hdparm -W0 /dev/sdb
+hdparm -W0 /dev/sdd
+# enbable SSD cache
+hdparm -W1 /dev/sda
+
+# reboot and check if still set:
+reboot
+hdparm -W /dev/sda
+hdparm -W /dev/sdb
+hdparm -W /dev/sdc
+hdparm -W /dev/sdd
+
+# if not, automate at boot...
+
+
+
+# prepare RAID
+pacman -S mdadm
+# for each disk: delete super block
+mdadm --zero-superblock /dev/sdb
+# for each disk: create partition. Fill it almost completely
+gdisk /dev/sdb
+o # new table
+n 2048s +1860G FD00 # start at 2048s (so it's aligned with HDD blocks)
+p
+w
+
+# create RAID
+mdadm --create --verbose --level=5 --metadata=1.2 --raid-devices=3 /dev/md0 /dev/sdb1 /dev/sdc1 /dev/sdd1
+# write config
+echo 'DEVICE partitions' > /etc/mdadm.conf
+mdadm --detail --scan >> /etc/mdadm.conf
+
+# assemble all arrays
+mdadm --assemble --scan
+
+# status:
+cat /proc/mdstat
+
+# create LVM
+pvcreate /dev/md0
+pvdisplay
+vgcreate DATA /dev/md0
+vgdisplay
+
+# create volume for data
+lvcreate -l 100%FREE -n theData DATA /dev/md0
+# or
+lvcreate -L 3TB -n theData DATA /dev/md0
+
+lvs # display LV
+
+####################
+## LVM-Cache
+####################
+# I'll actually skip caching for now, but it works.
+# Can also be done at any time later on...
+
+# create a LVM physical volume on SSD-part and add it to the volume group
+pvcreate /dev/sda4
+vgextend DATA /dev/sda4
+
+# create the logical volumes for caching
+# metadata: min 8 MB, circa 0.1% of data (here 4GB for 4TG data)
+lvcreate -L 4G -n theData_cache_meta DATA /dev/sda4
+# cache:
+lvcreate -L 57G -n theData_cache DATA /dev/sda4
+
+# convert the cache and metadata to a cache-pool
+lvconvert --type cache-pool --cachemode writethrough --poolmetadata DATA/theData_cache_meta DATA/theData_cache
+# add the cache-pool to the data (aka make data-volume cached)
+lvconvert --type cache --cachepool DATA/theData_cache DATA/theData
+
+# Cache status:
+lvs -a -o +devices
+dmsetup status /dev/mapper/DATA-theData
+
+
+# to remove caching again:
+lvconvert --uncache DATA/theData
+# remove SSD part from colume group
+vgreduce DATA /dev/sda4
+# and un-LVM it
+pvremove /dev/sda4
+
+####################
+## format LVM partition
+####################
+
+# recommentation: check https://raid.wiki.kernel.org/index.php/RAID_setup#ext2.2C_ext3.2C_and_ext4_.282011.29
+# for good performance, create file system with:
+chunk size: 512 kB (check which chunk size you have with mdadm -E /dev/sdb1)
+block size: 4k (good in most cases)
+stride = chunk / block = 512kB / 4k = 128
+stripe-width = stride * ( (n disks in raid5) - 1 ) = 128 * ( (3) - 1 ) = 128 * 2 = 256 
+
+mkfs.ext4 -v -m .01 -b 4096 -E stride=128,stripe-width=256 /dev/DATA/theData
+
+ Options explained:
+     -v verbose
+     -m .01 leave 0.01% of disk to root (so it doesnt fill and cause problems)
+     -b 4096 block size of 4kb (recommended above for large-file systems)
+     -E stride=128,stripe-width=256 see above calculation
+
+# you can also change the parameters afterwards:
+tune2fs -E stride=n,stripe-width=m /dev/mdx
+
+# you can now mount your file system with
+mount /dev/DATA/theData /my/random/mountpoint
+
+#####################
+## Additional tuning
+#####################
+
+# send HDDs in standby immediately:
+hdparm -y /dev/sd[b-d]
+
+# set HDDs to standby after 30 minutes:
+hdparm -S 241 /dev/sd[b-d]
+
+# check HDD standby status
+hdparm -C /dev/sd[b-d]
